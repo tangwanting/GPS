@@ -25,6 +25,13 @@ typedef NS_ENUM(NSInteger, GPSEnvironmentType) {
     GPSEnvironmentTypeCanyon 
 };
 
+// 在头文件中添加类型定义
+typedef NS_ENUM(NSInteger, GPSSimulatorMode) {
+    GPSSimulatorModeSingle,
+    GPSSimulatorModeRoute,
+    GPSSimulatorModeRandomWalk
+};
+
 @interface GPSAdvancedLocationSimulator : NSObject
 
 + (instancetype)sharedInstance;
@@ -35,7 +42,7 @@ typedef NS_ENUM(NSInteger, GPSEnvironmentType) {
 @property (nonatomic, assign) BOOL enableSignalDrift; // 模拟真实GPS信号漂移
 @property (nonatomic, assign) BOOL enableAutoAccuracy; // 自动调整精度
 
-@property (nonatomic, strong, readonly) NSTimer *simulationTimer;
+@property (nonatomic, strong) dispatch_source_t simulationTimer;
 
 // 位置生成
 - (CLLocation *)generateSimulatedLocationWithBase:(GPSLocationModel *)baseLocation;
@@ -56,5 +63,12 @@ typedef NS_ENUM(NSInteger, GPSEnvironmentType) {
                            updateInterval:(NSTimeInterval)interval 
                         completionHandler:(void (^)(GPSLocationModel *newLocation))handler;
 - (void)stopSimulation;
+
+// 公开的API方法
+- (void)startSimulationWithInitialLocation:(GPSLocationModel *)initialLocation 
+                           updateInterval:(NSTimeInterval)interval 
+                        completionHandler:(void (^)(GPSLocationModel *))completionBlock;
+- (void)stopSimulation;
+- (GPSLocationModel *)generateNextLocation;
 
 @end

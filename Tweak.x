@@ -464,61 +464,85 @@ NSString *const kShowGPSSettingsNotification = @"ShowGPSSettings";
 // 伪造位置的方法实现
 %new
 - (void)sendFakeLocationUpdate {
-    GPSLocationManager *manager = [GPSLocationManager sharedManager];
-    CLLocation *fakeLocation = [manager nextFakeLocation];
-    
-    if (self.delegate && [self.delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
-        [self.delegate locationManager:self didUpdateLocations:@[fakeLocation]];
+    GPSLocationViewModel *viewModel = [GPSLocationViewModel sharedInstance];
+    if (viewModel.isLocationSpoofingEnabled) {
+        CLLocationCoordinate2D coordinate = viewModel.currentLocation.coordinate;
+        
+        if (CLLocationCoordinate2DIsValid(coordinate)) {
+            // 创建一个准确的CLLocation对象
+            double accuracy = viewModel.currentLocation.accuracy > 0 ? viewModel.currentLocation.accuracy : 5.0;
+            double altitude = viewModel.currentLocation.altitude;
+            double speed = viewModel.currentLocation.speed;
+            double course = viewModel.currentLocation.course;
+            
+            NSDate *timestamp = [NSDate date];
+            
+            // 创建完整的CLLocation对象，确保所有属性都有值
+            CLLocation *fakeLocation = [[CLLocation alloc] 
+                initWithCoordinate:coordinate
+                altitude:altitude
+                horizontalAccuracy:accuracy
+                verticalAccuracy:accuracy
+                course:course
+                speed:speed
+                timestamp:timestamp];
+            
+            // 确保代理方法存在后再调用
+            if (self.delegate && [self.delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self.delegate locationManager:self didUpdateLocations:@[fakeLocation]];
+                });
+            }
+            
+            // 确保回调块也被调用 - 使用更兼容的方式
+            if (@available(iOS 14.0, *)) {
+                SEL handlerSelector = NSSelectorFromString(@"locationUpdateHandler");
+                if ([self respondsToSelector:handlerSelector]) {
+                    id handler = [self valueForKey:@"locationUpdateHandler"];
+                    if (handler && [handler isKindOfClass:NSClassFromString(@"NSBlock")]) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            // 使用performSelector调用block
+                            typedef void (^LocationUpdateHandlerBlock)(CLLocationManager *, NSArray *, NSError *);
+                            LocationUpdateHandlerBlock block = handler;
+                            block(self, @[fakeLocation], nil);
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
 - (void)startUpdatingLocation {
-    BOOL isEnabled = [GPSLocationManager sharedManager].isLocationSpoofingEnabled;
-    
-    if (!isEnabled) {
-        %orig; // 调用原始方法
-    } else {
-        // 模拟位置更新
-        if (self.delegate && [self.delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
-            // 初始更新
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self sendFakeLocationUpdate];
-                
-                // 设置定时更新
-                if ([GPSLocationManager sharedManager].isMovingModeEnabled || 
-                    [GPSLocationManager sharedManager].isAutoStepEnabled) {
-                    
-                    // 创建定时器，模拟位置更新频率
-                    double updateFrequency = 1.0; // 默认1秒更新一次
-                    
-                    // 移动模式下，根据速度调整更新频率
-                    if ([GPSLocationManager sharedManager].isMovingModeEnabled) {
-                        double speed = [GPSLocationManager sharedManager].movingSpeed;
-                        if (speed > 0) {
-                            // 速度越快，更新频率越高
-                            updateFrequency = 1.0 / (speed * 0.2);
-                            // 限制范围 0.1-2.0秒
-                            updateFrequency = fmax(0.1, fmin(updateFrequency, 2.0));
-                        }
-                    }
-                    
-                    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-                    dispatch_source_set_timer(timer, 
-                                           dispatch_time(DISPATCH_TIME_NOW, updateFrequency * NSEC_PER_SEC), 
-                                           updateFrequency * NSEC_PER_SEC, 
-                                           0.1 * NSEC_PER_SEC);
-                    
-                    dispatch_source_set_event_handler(timer, ^{
-                        [self sendFakeLocationUpdate];
-                    });
-                    
-                    dispatch_resume(timer);
-                    
-                    // 保存计时器引用
-                    objc_setAssociatedObject(self, "fakeLocationTimer", timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                }
-            });
+    GPSLocationViewModel *viewModel = [GPSLocationViewModel sharedInstance];
+    if (viewModel.isLocationSpoofingEnabled) {
+        // 拦截标准方法，启动自己的模拟器
+        NSLog(@"[GPS++] 拦截并替换位置更新 - 使用模拟位置");
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sendFakeLocationUpdate) object:nil];
+        [self performSelector:@selector(sendFakeLocationUpdate) withObject:nil afterDelay:0.1];
+        
+        // 设置定时器持续发送虚拟位置
+        static dispatch_source_t timer;
+        if (timer) {
+            dispatch_source_cancel(timer);
+            timer = nil;
         }
+        
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(timer, 
+                                 dispatch_time(DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC), 
+                                 0.5 * NSEC_PER_SEC,  // 每0.5秒更新一次
+                                 0.1 * NSEC_PER_SEC);
+        
+        __weak typeof(self) weakSelf = self;
+        dispatch_source_set_event_handler(timer, ^{
+            [weakSelf sendFakeLocationUpdate];
+        });
+        
+        dispatch_resume(timer);
+    } else {
+        // 如果没有启用模拟，使用原始方法
+        %orig;
     }
 }
 

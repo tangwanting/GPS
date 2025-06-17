@@ -343,46 +343,71 @@
 - (void)loadSettings {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     
+    // 加载基本设置
     self.isLocationSpoofingEnabled = [defaults boolForKey:kLocationSpoofingEnabledKey];
     self.isAltitudeSpoofingEnabled = [defaults boolForKey:kAltitudeSpoofingEnabledKey];
-    self.movingSpeed = [defaults doubleForKey:kMovingSpeedKey] ?: 5.0; // 默认速度5米/秒
-    self.randomRadius = [defaults doubleForKey:kRandomRadiusKey] ?: 50.0; // 默认随机半径50米
-    self.stepDistance = [defaults doubleForKey:kStepDistanceKey] ?: 10.0; // 默认步进10米
-    self.movementMode = [defaults integerForKey:kMovementModeKey] ?: GPSMovementModeNone;
     
-    // 尝试加载保存的路径
-    NSArray *pathArray = [defaults objectForKey:kMovingPathKey];
-    if (pathArray.count > 0) {
-        [self.pathPoints removeAllObjects];
-        for (NSDictionary *pointDict in pathArray) {
-            GPSLocationModel *point = [GPSLocationModel modelWithDictionary:pointDict];
-            if (point) {
-                [self.pathPoints addObject:point];
-            }
-        }
+    // 加载位置参数
+    double latitude = [defaults doubleForKey:kLatitudeKey];
+    double longitude = [defaults doubleForKey:kLongitudeKey];
+    
+    // 只有当坐标有效时才设置
+    if (latitude != 0 || longitude != 0) {
+        GPSLocationModel *location = [[GPSLocationModel alloc] init];
+        location.coordinate = CLLocationCoordinate2DMake(latitude, longitude);
+        self.currentLocation = location;
+        
+        // 加载位置的其他属性
+        location.altitude = [defaults doubleForKey:kAltitudeKey];
+        location.speed = [defaults doubleForKey:kSpeedKey];
+        location.course = [defaults doubleForKey:kCourseKey];
+        location.accuracy = [defaults doubleForKey:kAccuracyKey];
+    } else {
+        // 如果没有保存过位置，设置默认位置（例如北京天安门）
+        GPSLocationModel *defaultLocation = [[GPSLocationModel alloc] init];
+        defaultLocation.coordinate = CLLocationCoordinate2DMake(39.9087, 116.3974);
+        self.currentLocation = defaultLocation;
+        defaultLocation.altitude = 50.0;
+        defaultLocation.speed = 0.0;
+        defaultLocation.course = 0.0;
+        defaultLocation.accuracy = 5.0;
     }
+    
+    // 加载移动模式相关设置
+    self.isMovingModeEnabled = [defaults boolForKey:kMovingModeEnabledKey];
+    self.movementMode = [defaults integerForKey:kMovementModeKey];
+    self.movingSpeed = [defaults doubleForKey:kMovingSpeedKey] ?: 1.4;  // 默认值
+    self.randomRadius = [defaults doubleForKey:kRandomRadiusKey] ?: 50.0;  // 默认值
+    self.stepDistance = [defaults doubleForKey:kStepDistanceKey] ?: 10.0;  // 默认值
 }
 
 - (void)saveSettings {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    
     [defaults setBool:self.isLocationSpoofingEnabled forKey:kLocationSpoofingEnabledKey];
     [defaults setBool:self.isAltitudeSpoofingEnabled forKey:kAltitudeSpoofingEnabledKey];
+    
+    // 保存当前位置和相关参数
+    [defaults setDouble:self.currentLocation.coordinate.latitude forKey:kLatitudeKey];
+    [defaults setDouble:self.currentLocation.coordinate.longitude forKey:kLongitudeKey];
+    
+    // 保存位置其他属性
+    [defaults setDouble:self.currentLocation.altitude forKey:kAltitudeKey];
+    [defaults setDouble:self.currentLocation.speed forKey:kSpeedKey];
+    [defaults setDouble:self.currentLocation.course forKey:kCourseKey];
+    [defaults setDouble:self.currentLocation.accuracy forKey:kAccuracyKey];
+    
+    // 保存移动模式相关设置
+    [defaults setBool:self.isMovingModeEnabled forKey:kMovingModeEnabledKey];
+    [defaults setInteger:self.movementMode forKey:kMovementModeKey];
     [defaults setDouble:self.movingSpeed forKey:kMovingSpeedKey];
     [defaults setDouble:self.randomRadius forKey:kRandomRadiusKey];
     [defaults setDouble:self.stepDistance forKey:kStepDistanceKey];
-    [defaults setInteger:self.movementMode forKey:kMovementModeKey];
     
-    // 保存路径
-    if (self.pathPoints.count > 0) {
-        NSMutableArray *pathArray = [NSMutableArray arrayWithCapacity:self.pathPoints.count];
-        for (GPSLocationModel *point in self.pathPoints) {
-            [pathArray addObject:[point toDictionary]];
-        }
-        [defaults setObject:pathArray forKey:kMovingPathKey];
-    }
-    
+    // 立即同步设置
     [defaults synchronize];
+    
+    // 发出设置更改通知
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"GPSSettingsChanged" object:nil];
 }
 
 @end

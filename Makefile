@@ -1,7 +1,7 @@
 # 插件：显示编译成功，显示的信息
 PACKAGE_IDENTIFIER = com.pxx917144686.gps
 PACKAGE_NAME = GPS++
-PACKAGE_VERSION = 0.2
+PACKAGE_VERSION = 0.3
 PACKAGE_ARCHITECTURE = iphoneos-arm64 iphoneos-arm64e
 PACKAGE_REVISION = 1
 PACKAGE_SECTION = Tweaks
@@ -12,7 +12,7 @@ PACKAGE_DESCRIPTION = 功能强大的iOS位置工具
 define Package/GPS++
   Package: com.pxx917144686.gps
   Name: GPS++
-  Version: 0.2
+  Version: 0.3
   Architecture: iphoneos-arm64 iphoneos-arm64e
   Author: pxx917144686
   Section: Tweaks
@@ -37,7 +37,7 @@ export THEOS_PACKAGE_SCHEME = rootless
 THEOS_PACKAGE_INSTALL_PREFIX = /var/jb
 
 # 系统库
-INSTALL_TARGET_PROCESSES = Aweme
+INSTALL_TARGET_PROCESSES = SpringBoard locationd backboardd thermalmonitord mediaserverd syncdefaultsd ReportCrash aggregated com.apple.Maps Weather
 
 # 引入 Theos 的通用设置
 include $(THEOS)/makefiles/common.mk

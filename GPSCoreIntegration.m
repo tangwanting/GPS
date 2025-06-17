@@ -18,6 +18,25 @@
 #import "GPSRouteManager.h"
 #import "GPSSmartPathEngine.h"
 
+// 添加常量定义
+// 全局常量定义
+#define kUserDefaultsDomain                @"com.gps.locationspoofer"
+#define kLocationSpoofingEnabledKey        @"LocationSpoofingEnabled"
+#define kAltitudeSpoofingEnabledKey        @"AltitudeSpoofingEnabled"
+#define kLatitudeKey                       @"latitude"
+#define kLongitudeKey                      @"longitude"
+#define kAltitudeKey                       @"altitude"
+#define kSpeedKey                          @"speed" 
+#define kCourseKey                         @"course"
+#define kAccuracyKey                       @"accuracy"
+#define kLocationHistoryKey                @"LocationHistory"
+#define kMovingModeEnabledKey              @"MovingModeEnabled"
+#define kMovingPathKey                     @"MovingPath"
+#define kMovingSpeedKey                    @"MovingSpeed"
+#define kRandomRadiusKey                   @"RandomRadius"
+#define kStepDistanceKey                   @"StepDistance" 
+#define kMovementModeKey                   @"MovementMode"
+
 // 模块前向声明 - 移到这里，在使用之前声明
 @interface GPSCoreLocationModule : NSObject <GPSModuleProtocol>
 @property (nonatomic, strong) GPSAdvancedLocationSimulator *simulator;
@@ -43,6 +62,11 @@
 @interface GPSAnalyticsModule : NSObject <GPSModuleProtocol>
 @property (nonatomic, strong) GPSAnalyticsSystem *analyticsSystem;
 @property (nonatomic, strong) GPSRecordingSystem *recordingSystem;
+@end
+
+// 扩展GPSSystemIntegration声明缺失的方法
+@interface GPSSystemIntegration (CoreIntegrationExtension)
+- (void)applyAllProfiles;
 @end
 
 @interface GPSCoreIntegration : NSObject <GPSEventListener>
@@ -175,14 +199,12 @@
 
 @implementation GPSCoreLocationModule
 
-- (void)initialize {
-    self.simulator = [GPSAdvancedLocationSimulator sharedInstance];
-    self.viewModel = [GPSLocationViewModel sharedInstance];
-    
-    // 加载保存的设置
-    [self.viewModel loadSettings];
-    
-    NSLog(@"GPS++ 核心位置模拟模块已初始化");
+- (instancetype)init {
+    if (self = [super init]) {
+        _simulator = [GPSAdvancedLocationSimulator sharedInstance];
+        _viewModel = [GPSLocationViewModel sharedInstance];
+    }
+    return self;
 }
 
 - (void)start {
@@ -192,14 +214,24 @@
         if (location) {
             __weak typeof(self) weakSelf = self;
             [self.simulator startSimulationWithInitialLocation:location 
-                                               updateInterval:1.0 
-                                            completionHandler:^(GPSLocationModel *newLocation) {
-                [weakSelf.viewModel setCurrentLocation:newLocation];
-                
-                // 发布位置变更事件
-                [[GPSEventSystem sharedInstance] publishEvent:GPSEventTypeLocationChanged 
+                                           updateInterval:0.5  // 增加更新频率 
+                                        completionHandler:^(GPSLocationModel *newLocation) {
+                if (newLocation) {
+                    [weakSelf.viewModel setCurrentLocation:newLocation];
+                    
+                    // 发布位置变更事件
+                    [[GPSEventSystem sharedInstance] publishEvent:GPSEventTypeLocationChanged 
                                                  withPayload:newLocation];
+                                                 
+                    // 应用所有的配置文件更改
+                    [[GPSSystemIntegration sharedInstance] applyAllProfiles];
+                }
             }];
+            
+            // 通知系统GPS已启动
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"GPSSimulationStarted" object:nil];
+        } else {
+            NSLog(@"无法启动模拟：当前位置为空");
         }
     }
     
@@ -211,12 +243,39 @@
     NSLog(@"GPS++ 核心位置模拟模块已停止");
 }
 
-- (NSDictionary *)currentStatus {
-    return @{
-        @"enabled": @(self.viewModel.isLocationSpoofingEnabled),
-        @"simulationActive": @(self.simulator.simulationTimer != nil),
-        @"movementMode": @(self.viewModel.movementMode)
-    };
+- (void)reset {
+    [self stop];
+    // 重置所有设置但保留当前位置
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    double latitude = [defaults doubleForKey:kLatitudeKey];
+    double longitude = [defaults doubleForKey:kLongitudeKey];
+    
+    // 清除所有设置
+    NSArray *keysToRemove = @[
+        kLocationSpoofingEnabledKey,
+        kAltitudeSpoofingEnabledKey,
+        kSpeedKey,
+        kCourseKey,
+        kAccuracyKey,
+        kMovingModeEnabledKey,
+        kMovementModeKey,
+        kMovingSpeedKey,
+        kRandomRadiusKey,
+        kStepDistanceKey
+    ];
+    
+    for (NSString *key in keysToRemove) {
+        [defaults removeObjectForKey:key];
+    }
+    
+    // 保留位置信息
+    [defaults setDouble:latitude forKey:kLatitudeKey];
+    [defaults setDouble:longitude forKey:kLongitudeKey];
+    [defaults setDouble:50.0 forKey:kAltitudeKey];
+    [defaults synchronize];
+    
+    // 重新加载设置
+    [self.viewModel loadSettings];
 }
 
 @end

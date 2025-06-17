@@ -11,6 +11,13 @@
 #import <CoreLocation/CoreLocation.h>
 #import <dlfcn.h> // 添加动态库加载支持
 
+// 添加内存统计所需头文件
+#import <mach/mach.h>
+#import <mach/mach_host.h>
+#import <mach/host_info.h>
+#import <mach/task_info.h>
+#import <mach/vm_map.h>
+
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
 @interface NSTask : NSObject
 - (void)setLaunchPath:(NSString *)path;
@@ -39,8 +46,10 @@
 
 @end
 
+// 在类的私有接口中添加所需的方法声明
 @interface GPSSystemIntegration()
 
+// 现有属性
 @property (nonatomic, strong) NSMutableDictionary *appProfiles;
 @property (nonatomic, assign) BOOL systemWideIntegrationEnabled;
 @property (nonatomic, assign) GPSIntegrationLevel currentIntegrationLevel;
@@ -48,15 +57,19 @@
 @property (nonatomic, assign) BOOL batteryOptimizationEnabled;
 @property (nonatomic, assign) BOOL memoryOptimizationEnabled;
 @property (nonatomic, assign) NSInteger integrationPriority;
-
 @property (nonatomic, assign) NSInteger maxConcurrentApps;
 @property (nonatomic, strong) NSMutableArray *activeApps;
 @property (nonatomic, strong) NSMutableDictionary *appHooks;
 
+// 添加缺失的方法声明
+- (BOOL)isJailbroken;
+- (void)applyBatteryOptimizations;
+- (void)removeBatteryOptimizations;
+- (void)applyMemoryOptimizations;
+- (void)removeMemoryOptimizations;
+- (void)restartApp:(NSString *)bundleId;
+- (GPSAppIntegrationProfile *)systemWideProfile;
 - (BOOL)isDopamineJailbreak;
-- (void)setupForDopamineEnvironment;
-- (void)determineAvailableIntegrationLevel;
-- (void)setupForSpecificJailbreak;
 
 @end
 
@@ -111,8 +124,28 @@
 #pragma mark - 状态检查
 
 - (void)determineAvailableIntegrationLevel {
-    // 强制使用基本级别，避免尝试越狱检测
-    _currentIntegrationLevel = GPSIntegrationLevelNormal;
+    // 首先检测是否为越狱环境
+    if ([self isJailbroken]) {
+        NSLog(@"[GPS++] 检测到越狱环境");
+        
+        // 尝试获取高级权限
+        if ([self attemptToGetEnhancedPermissions]) {
+            if ([self isDopamineJailbreak]) {
+                // Dopamine越狱环境下，禁用系统级功能
+                _currentIntegrationLevel = GPSIntegrationLevelDeep;
+                NSLog(@"[GPS++] Dopamine环境下可用最高权限为深度集成级别");
+            } else {
+                _currentIntegrationLevel = GPSIntegrationLevelSystem;
+                NSLog(@"[GPS++] 获取到系统级集成权限");
+            }
+        } else {
+            _currentIntegrationLevel = GPSIntegrationLevelDeep;
+            NSLog(@"[GPS++] 获取到深度集成权限");
+        }
+    } else {
+        _currentIntegrationLevel = GPSIntegrationLevelNormal;
+        NSLog(@"[GPS++] 使用普通集成权限");
+    }
 }
 
 - (GPSIntegrationLevel)availableIntegrationLevel {
@@ -820,921 +853,117 @@
         }
     }
     
-    // 创建特定应用的plist
-    NSString *plistName = [NSString stringWithFormat:@"GPSSpoofer_%@.plist", [bundleId stringByReplacingOccurrencesOfString:@"." withString:@"_"]];
-    NSString *plistPath = [tweakInjectPath stringByAppendingPathComponent:plistName];
+    // 确保目录存在
+    if (![[NSFileManager defaultManager] fileExistsAtPath:tweakInjectPath]) {
+        NSLog(@"注入目录不存在: %@", tweakInjectPath);
+        return;
+    }
     
+    // 创建plist文件内容
     NSDictionary *plistDict = @{
         @"Filter": @{
-            @"Bundles": @[bundleId]
+            @"Bundles": @[bundleId],
+            @"Executables": @[]
         },
-        @"Location": @{
+        @"GPSCoordinate": @{
             @"Latitude": @(coordinate.latitude),
             @"Longitude": @(coordinate.longitude)
-        }
+        },
+        @"GPSEnabled": @YES
     };
     
-    BOOL success = [plistDict writeToFile:plistPath atomically:YES];
+    // 保存plist文件
+    NSString *plistPath = [tweakInjectPath stringByAppendingPathComponent:[NSString stringWithFormat:@"GPS_%@.plist", bundleId]];
+    [plistDict writeToFile:plistPath atomically:YES];
     
-    if (success) {
-        NSLog(@"成功为应用安装Hook: %@", bundleId);
-    } else {
-        NSLog(@"为应用创建Hook失败: %@", bundleId);
+    NSLog(@"已为应用 %@ 安装位置Hook: (%f, %f)", bundleId, coordinate.latitude, coordinate.longitude);
+    
+    // 尝试重启目标应用（如果可能）
+    [self restartApp:bundleId];
+}
+
+- (void)applyAllProfiles {
+    for (NSString *bundleId in self.appProfiles) {
+        GPSAppIntegrationProfile *profile = self.appProfiles[bundleId];
+        if (profile && profile.enabled && profile.useCustomLocation) {
+            [self applyProfileChangesForApp:bundleId];
+        }
+    }
+    
+    // 如果启用了系统级集成，也应用系统级配置
+    if (self.isSystemWideIntegrationEnabled) {
+        GPSAppIntegrationProfile *systemProfile = [self systemWideProfile];
+        if (systemProfile) {
+            [self applySystemWideLocationSpoofing:systemProfile];
+        }
     }
 }
 
-#pragma mark - 越狱环境配置与系统Hook
-
-- (void)setupForSpecificJailbreak {
-    // 检测Dopamine越狱
-    if ([self isDopamineJailbreak]) {
-        NSLog(@"检测到Dopamine越狱，正在应用专用设置");
-        [self setupForDopamineEnvironment];
-    } else if ([self isTrollStoreInstalled]) {
-        NSLog(@"检测到TrollStore环境，正在应用相应设置");
-        [self setupForTrollStoreEnvironment];
-    } else if ([self isPalera1nJailbreak]) {
-        NSLog(@"检测到palera1n越狱，正在应用专用设置");
-        [self setupForPalera1nEnvironment];
-    } else if ([self isLegacyJailbreak]) {
-        NSLog(@"检测到传统越狱环境，正在应用标准设置");
-        [self setupForLegacyJailbreakEnvironment];
+// 修复权限不足的重启应用方法
+- (void)restartApp:(NSString *)bundleId {
+    if (self.currentIntegrationLevel < GPSIntegrationLevelDeep) {
+        NSLog(@"权限不足，无法重启应用");
+        return;
     }
+    
+    if ([self isDopamineJailbreak]) {
+        // 使用NSTask替代system
+        NSTask *task = [[NSTask alloc] init];
+        [task setLaunchPath:@"/var/jb/usr/bin/killall"];
+        [task setArguments:@[bundleId]];
+        [task launch];
+    } else {
+        // 使用NSTask替代system
+        NSTask *task = [[NSTask alloc] init];
+        [task setLaunchPath:@"/usr/bin/killall"];
+        [task setArguments:@[bundleId]];
+        [task launch];
+    }
+}
+
+// 修复所有使用了错误属性名称的地方
+- (GPSAppIntegrationProfile *)systemWideProfile {
+    GPSAppIntegrationProfile *profile = [[GPSAppIntegrationProfile alloc] init];
+    profile.bundleId = @"com.apple.locationd";
+    profile.appName = @"System Location Services";
+    profile.enabled = self.isSystemWideIntegrationEnabled;
+    
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    double latitude = [defaults doubleForKey:@"SystemLatitude"];
+    double longitude = [defaults doubleForKey:@"SystemLongitude"];
+    
+    if (latitude != 0 && longitude != 0) {
+        profile.customCoordinate = CLLocationCoordinate2DMake(latitude, longitude);
+        profile.useCustomLocation = YES;
+    } else {
+        profile.useCustomLocation = NO;
+    }
+    
+    return profile;
 }
 
 - (BOOL)isDopamineJailbreak {
-    @try {
-        // 添加更稳定的检测逻辑
-        NSFileManager *fm = [NSFileManager defaultManager];
-        
-        // 如果偏好设置已标记，直接返回
-        NSString *savedType = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakType"];
-        if ([savedType isEqualToString:@"dopamine"]) {
-            return YES;
-        }
-        
-        // 检测核心文件
-        if ([fm fileExistsAtPath:@"/var/jb/.installed_dopamine"]) {
-            return YES;
-        }
-        
-        // 轻量级检测，避免过多访问文件系统
-        NSArray *quickCheckPaths = @[
-            @"/var/jb/basebin/launchd", 
-            @"/var/jb/usr/lib/TweakInject"
-        ];
-        
-        for (NSString *path in quickCheckPaths) {
-            if ([fm fileExistsAtPath:path]) {
-                return YES;
-            }
-        }
-        
-        return NO;
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] 越狱检测异常: %@", exception);
-        return NO;
-    }
-}
-
-- (BOOL)isTrollStoreInstalled {
-    return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/containers/Bundle/dylibs"] ||
-           [[UIApplication sharedApplication] canOpenURL:[NSURL URLWithString:@"trollstore://"]];
-}
-
-- (BOOL)isPalera1nJailbreak {
-    NSArray *paths = @[
-        @"/var/jb/basebin/palera1n",
-        @"/var/jb/.palecursus_strapped"
+    // 检查Dopamine越狱的特定路径
+    NSArray *dopaminePaths = @[
+        @"/var/jb/usr/lib/TweakInject",
+        @"/var/jb/basebin",
+        @"/var/jb/.installed_dopamine"
     ];
     
-    for (NSString *path in paths) {
+    for (NSString *path in dopaminePaths) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             return YES;
         }
     }
-    return NO;
-}
-
-- (BOOL)isLegacyJailbreak {
-    NSArray *paths = @[
-        @"/Library/MobileSubstrate/MobileSubstrate.dylib",
-        @"/Applications/Cydia.app"
-    ];
     
-    for (NSString *path in paths) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-- (void)setupForDopamineEnvironment {
-    @try {
-        NSLog(@"[GPS++] 正在安全配置Dopamine越狱环境");
-        
-        // 保存基本配置
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        
-        // 路径前缀 - 标记但不尝试访问
-        NSString *jbPrefix = @"/var/jb";
-        
-        // 安全设置TweakInject路径，不尝试创建文件
-        NSString *tweakInjectPath = @"/var/jb/usr/lib/TweakInject";
-        if (![[NSFileManager defaultManager] fileExistsAtPath:tweakInjectPath]) {
-            tweakInjectPath = @"/var/jb/Library/MobileSubstrate/DynamicLibraries";
-        }
-        
-        // 保存配置
-        [defaults setObject:jbPrefix forKey:@"JailbreakPrefix"];
-        [defaults setObject:tweakInjectPath forKey:@"TweakInjectPath"];
-        [defaults setObject:@"/var/jb/usr/bin" forKey:@"BinaryPath"];
-        [defaults setObject:@"dopamine" forKey:@"JailbreakType"];
-        [defaults synchronize];
-        
-        // 避免系统级钩子，设置级别为Deep而不是System
-        self.currentIntegrationLevel = GPSIntegrationLevelDeep;
-        
-        NSLog(@"[GPS++] Dopamine环境已安全配置");
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] Dopamine环境配置异常: %@", exception);
-    }
-}
-
-- (void)setupForTrollStoreEnvironment {
-    // 设置TrollStore特定路径和配置
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setObject:@"" forKey:@"JailbreakPrefix"];
-    [defaults setObject:@"/var/containers/Bundle/dylibs" forKey:@"TweakInjectPath"];
-    [defaults setObject:@"/var/containers/Bundle/Application/TrollStore.app/TS_BinPack" forKey:@"BinaryPath"];
-    [defaults setObject:@"trollstore" forKey:@"JailbreakType"];
-    [defaults synchronize];
-    
-    // TrollStore环境中使用更安全的设置
-    self.currentIntegrationLevel = GPSIntegrationLevelNormal;
-}
-
-- (void)setupForPalera1nEnvironment {
-    // 设置palera1n特定路径和配置
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setObject:@"/var/jb" forKey:@"JailbreakPrefix"];
-    [defaults setObject:@"/var/jb/usr/lib/TweakInject" forKey:@"TweakInjectPath"];
-    [defaults setObject:@"/var/jb/usr/bin" forKey:@"BinaryPath"];
-    [defaults setObject:@"palera1n" forKey:@"JailbreakType"];
-    [defaults synchronize];
-}
-
-- (void)setupForLegacyJailbreakEnvironment {
-    // 设置传统越狱的路径和配置
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setObject:@"" forKey:@"JailbreakPrefix"];
-    [defaults setObject:@"/Library/MobileSubstrate/DynamicLibraries" forKey:@"TweakInjectPath"];
-    [defaults setObject:@"/usr/bin" forKey:@"BinaryPath"];
-    [defaults setObject:@"legacy" forKey:@"JailbreakType"];
-    [defaults synchronize];
-}
-
-- (void)installSystemHooks {
-    // 检测到Dopamine环境时，禁用系统钩子安装
-    if ([self isDopamineJailbreak]) {
-        NSLog(@"[GPS++] 在Dopamine环境中禁用系统钩子安装以防止崩溃");
-        return;
-    }
-    
-    @try {
-        NSLog(@"[GPS++] 开始安装系统钩子");
-        
-        // 权限检查
-        if (self.availableIntegrationLevel < GPSIntegrationLevelDeep) {
-            NSLog(@"[GPS++] 权限不足，无法安装系统钩子");
-            return;
-        }
-        
-        // 检查文件系统权限，使用更安全的方法
-        NSString *testFile = @"/var/mobile/gps_test_file";
-        NSError *writeError = nil;
-        if (![@"test" writeToFile:testFile atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
-            NSLog(@"[GPS++] 文件系统权限不足，跳过系统钩子安装: %@", writeError);
-            return;
-        } else {
-            [[NSFileManager defaultManager] removeItemAtPath:testFile error:nil];
-        }
-        
-        // 使用配置文件方法而非直接文件操作
-        NSString *jbPrefix = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakPrefix"] ?: @"/var/jb";
-        
-        // 仅在非Dopamine越狱下继续执行敏感操作
-        if (![self isDopamineJailbreak]) {
-            // 安全实现...
-        }
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] 安装钩子异常: %@", exception);
-    }
-}
-
-- (void)removeSystemHooks {
-    // 优化可能导致崩溃的清理工作
-    if ([self isDopamineJailbreak]) {
-        NSLog(@"[GPS++] Dopamine环境中，使用安全方式移除系统钩子");
-        
-        // 只移除我们自己的文件，不触碰系统服务
-        NSString *tweakInjectPath = [[NSUserDefaults standardUserDefaults] objectForKey:@"TweakInjectPath"];
-        if (tweakInjectPath) {
-            NSError *error = nil;
-            NSString *plistPath = [tweakInjectPath stringByAppendingPathComponent:@"GPSSystemSpoof.plist"];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-                [[NSFileManager defaultManager] removeItemAtPath:plistPath error:&error];
-                if (error) {
-                    NSLog(@"[GPS++] 安全移除配置文件失败: %@", error);
-                }
-            }
-        }
-        
-        // 不重启系统服务
-        return;
-    }
-    
-    // 获取必要路径变量
-    NSString *tweakInjectPath = [[NSUserDefaults standardUserDefaults] objectForKey:@"TweakInjectPath"];
-    NSString *jbPrefix = [[NSUserDefaults standardUserDefaults] objectForKey:@"JailbreakPrefix"] ?: @"";
-    
-    if (!tweakInjectPath) {
-        // 使用默认路径
-        if ([self isDopamineJailbreak]) {
-            tweakInjectPath = @"/var/jb/usr/lib/TweakInject";
-        } else {
-            tweakInjectPath = @"/Library/MobileSubstrate/DynamicLibraries";
-        }
-    }
-    
-    // 移除动态库
-    NSString *dylibPath = [tweakInjectPath stringByAppendingPathComponent:@"GPSSystemSpoof.dylib"];
-    NSError *error = nil;
-    BOOL success = [[NSFileManager defaultManager] removeItemAtPath:dylibPath error:&error];
-    
-    if (!success || error) {
-        NSLog(@"移除动态库失败: %@", error);
-    }
-    
-    // 移除plist配置文件
-    NSString *plistPath = [tweakInjectPath stringByAppendingPathComponent:@"GPSSystemSpoof.plist"];
-    error = nil;
-    success = [[NSFileManager defaultManager] removeItemAtPath:plistPath error:&error];
-    
-    if (!success || error) {
-        NSLog(@"移除配置文件失败: %@", error);
-    }
-    
-    NSLog(@"Hook移除成功");
-    
-    // 重新加载系统服务
-    NSString *binPath = [[NSUserDefaults standardUserDefaults] objectForKey:@"BinaryPath"] ?: @"/usr/bin";
-    NSString *launchctlPath = [NSString stringWithFormat:@"%@%@", jbPrefix, binPath];
-    
-    if ([[NSFileManager defaultManager] fileExistsAtPath:[launchctlPath stringByAppendingPathComponent:@"launchctl"]]) {
-        NSTask *task = [[NSTask alloc] init];
-        [task setLaunchPath:[launchctlPath stringByAppendingPathComponent:@"launchctl"]];
-        [task setArguments:@[@"unload", @"/System/Library/LaunchDaemons/com.apple.locationd.plist"]];
-        [task launch];
-        
-        // 等待一小段时间后重新加载
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSTask *loadTask = [[NSTask alloc] init];
-            [loadTask setLaunchPath:[launchctlPath stringByAppendingPathComponent:@"launchctl"]];
-            [loadTask setArguments:@[@"load", @"/System/Library/LaunchDaemons/com.apple.locationd.plist"]];
-            [loadTask launch];
-        });
-    }
-}
-
-- (void)removeLocationHookForApp:(NSString *)bundleId {
-    // 移除特定应用的位置Hook
-    if (self.availableIntegrationLevel < GPSIntegrationLevelDeep) {
-        NSLog(@"权限不足，无法移除应用特定Hook");
-        return;
-    }
-    
-    NSString *tweakInjectPath = [[NSUserDefaults standardUserDefaults] objectForKey:@"TweakInjectPath"];
-    if (!tweakInjectPath) {
-        // 使用默认路径
-        if ([self isDopamineJailbreak]) {
-            tweakInjectPath = @"/var/jb/usr/lib/TweakInject";
-        } else {
-            tweakInjectPath = @"/Library/MobileSubstrate/DynamicLibraries";
-        }
-    }
-    
-    // 删除特定应用的plist
-    NSString *plistName = [NSString stringWithFormat:@"GPSSpoofer_%@.plist", [bundleId stringByReplacingOccurrencesOfString:@"." withString:@"_"]];
-    NSString *plistPath = [tweakInjectPath stringByAppendingPathComponent:plistName];
-    
-    NSError *error = nil;
-    [[NSFileManager defaultManager] removeItemAtPath:plistPath error:&error];
-    
-    if (error) {
-        NSLog(@"移除应用Hook失败: %@, 错误: %@", bundleId, error);
-    } else {
-        NSLog(@"成功移除应用Hook: %@", bundleId);
-    }
-}
-
-- (void)installSystemWideLocationHook {
-    // 对于Dopamine环境，完全禁用此功能
-    if ([self isDopamineJailbreak]) {
-        NSLog(@"[GPS++] 在Dopamine环境中禁用系统级位置钩子以防止崩溃");
-        
-        // 通知用户
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *alert = [UIAlertController 
-                alertControllerWithTitle:@"功能受限"
-                message:@"在Dopamine环境下，系统级位置模拟功能已被禁用以确保系统稳定。您仍可以使用应用级位置模拟功能。"
-                preferredStyle:UIAlertControllerStyleAlert];
-                
-            [alert addAction:[UIAlertAction actionWithTitle:@"了解" style:UIAlertActionStyleDefault handler:nil]];
-            
-            UIWindow *window = [UIApplication sharedApplication].keyWindow;
-            [window.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-        
-        return;
-    }
-    
-    // 获取配置信息
-    NSString *jbPrefix = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakPrefix"] ?: @"";
-    NSString *binPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"BinaryPath"] ?: @"/usr/bin";
-    
-    // 创建系统级别位置服务Hook
-    NSString *scriptPath = [NSString stringWithFormat:@"%@%@/gpshook", jbPrefix, binPath];
-    NSMutableString *scriptContent = [NSMutableString string];
-    [scriptContent appendString:@"#!/bin/bash\n"];
-    [scriptContent appendString:@"# GPS系统Hook by GPSSystemIntegration\n\n"];
-    [scriptContent appendString:@"PLIST_PATH=\"/var/mobile/Library/Preferences/com.gps.integration.plist\"\n"];
-    [scriptContent appendString:@"DAEMON_PLIST=\"/System/Library/LaunchDaemons/com.apple.locationd.plist\"\n\n"];
-    [scriptContent appendString:@"# 检查是否启用位置修改\n"];
-    [scriptContent appendString:@"if defaults read \"$PLIST_PATH\" GPSSystemWideEnabled &>/dev/null; then\n"];
-    [scriptContent appendString:@"  ENABLED=$(defaults read \"$PLIST_PATH\" GPSSystemWideEnabled)\n"];
-    [scriptContent appendString:@"  if [ \"$ENABLED\" -eq 1 ]; then\n"];
-    [scriptContent appendString:@"    LAT=$(defaults read \"$PLIST_PATH\" GPSLatitude)\n"];
-    [scriptContent appendString:@"    LON=$(defaults read \"$PLIST_PATH\" GPSLongitude)\n"];
-    [scriptContent appendString:@"    # 应用位置修改\n"];
-    [scriptContent appendString:@"    DYLD_INSERT_LIBRARIES=/usr/lib/GPSSystemHook.dylib locationd\n"];
-    [scriptContent appendString:@"  else\n"];
-    [scriptContent appendString:@"    # 正常运行locationd\n"];
-    [scriptContent appendString:@"    exec /usr/libexec/locationd\n"];
-    [scriptContent appendString:@"  fi\n"];
-    [scriptContent appendString:@"else\n"];
-    [scriptContent appendString:@"  # 配置不存在，正常运行locationd\n"];
-    [scriptContent appendString:@"  exec /usr/libexec/locationd\n"];
-    [scriptContent appendString:@"fi\n"];
-    
-    // 写入脚本文件
-    BOOL success = [scriptContent writeToFile:scriptPath 
-                                   atomically:YES 
-                                     encoding:NSUTF8StringEncoding 
-                                        error:nil];
-    
-    if (success) {
-        // 设置执行权限
-        NSString *chmodPath = [NSString stringWithFormat:@"%@%@/chmod", jbPrefix, binPath];
-        NSTask *chmodTask = [[NSTask alloc] init];
-        [chmodTask setLaunchPath:chmodPath];
-        [chmodTask setArguments:@[@"755", scriptPath]];
-        [chmodTask launch];
-        
-        // 保存配置
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        [defaults setBool:YES forKey:@"GPSSystemWideEnabled"];
-        [defaults synchronize];
-        
-        NSLog(@"系统级位置Hook已安装");
-    } else {
-        NSLog(@"系统级位置Hook安装失败: 无法创建脚本");
-    }
-}
-
-- (void)removeSystemWideLocationHook {
-    if (self.availableIntegrationLevel < GPSIntegrationLevelSystem) {
-        NSLog(@"无法移除系统级位置Hook: 权限不足");
-        return;
-    }
-    
-    // 获取配置信息
-    NSString *jbPrefix = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakPrefix"] ?: @"";
-    NSString *binPath = [[NSUserDefaults standardUserDefaults] stringForKey:@"BinaryPath"] ?: @"/usr/bin";
-    
-    // 删除系统级别位置服务Hook
-    NSString *scriptPath = [NSString stringWithFormat:@"%@%@/gpshook", jbPrefix, binPath];
-    
-    NSError *error = nil;
-    BOOL success = [[NSFileManager defaultManager] removeItemAtPath:scriptPath error:&error];
-    
-    if (success || ![[NSFileManager defaultManager] fileExistsAtPath:scriptPath]) {
-        // 更新配置
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        [defaults setBool:NO forKey:@"GPSSystemWideEnabled"];
-        [defaults synchronize];
-        
-        NSLog(@"系统级位置Hook已移除");
-    } else {
-        NSLog(@"系统级位置Hook移除失败: %@", error);
-    }
-    
-    // 重启位置服务
-    NSString *launchctl = [NSString stringWithFormat:@"%@%@/launchctl", jbPrefix, binPath];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:launchctl]) {
-        NSTask *task = [[NSTask alloc] init];
-        [task setLaunchPath:launchctl];
-        [task setArguments:@[@"restart", @"com.apple.locationd"]];
-        [task launch];
-    }
-}
-
-#pragma mark - 完善电池和内存优化实现
-
-- (void)applyBatteryOptimizations {
-    NSLog(@"正在应用电池优化");
-    
-    // 调整位置更新频率
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setInteger:5 forKey:@"GPSUpdateIntervalSeconds"]; // 5秒更新一次
-    
-    // 减少后台活动
-    [defaults setBool:YES forKey:@"GPSReduceBackgroundActivity"];
-    
-    // 调低位置精度
-    [defaults setInteger:100 forKey:@"GPSAccuracyInMeters"]; // 100米精度
-    
-    [defaults synchronize];
-    
-    // 通知所有活跃的GPS组件应用新设置
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"GPSOptimizationSettingsChanged" object:nil];
-}
-
-- (void)removeBatteryOptimizations {
-    NSLog(@"正在移除电池优化");
-    
-    // 恢复默认设置
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setInteger:1 forKey:@"GPSUpdateIntervalSeconds"]; // 1秒更新一次
-    [defaults setBool:NO forKey:@"GPSReduceBackgroundActivity"];
-    [defaults setInteger:10 forKey:@"GPSAccuracyInMeters"]; // 10米精度
-    [defaults synchronize];
-    
-    // 通知所有活跃的GPS组件应用新设置
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"GPSOptimizationSettingsChanged" object:nil];
-}
-
-- (void)applyMemoryOptimizations {
-    NSLog(@"正在应用内存优化");
-    
-    // 清理缓存
-    [self clearLocationCache];
-    
-    // 减少保存的历史记录数量
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setInteger:10 forKey:@"GPSMaxHistoryItems"]; // 只保留10条历史记录
-    [defaults setBool:YES forKey:@"GPSDisableDetailedLogs"]; // 禁用详细日志
-    [defaults synchronize];
-    
-    // 限制同时处理的应用数量
-    self.maxConcurrentApps = 3;
-}
-
-- (void)removeMemoryOptimizations {
-    NSLog(@"正在移除内存优化");
-    
-    // 恢复默认设置
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setInteger:50 forKey:@"GPSMaxHistoryItems"]; // 恢复为50条历史记录
-    [defaults setBool:NO forKey:@"GPSDisableDetailedLogs"]; // 启用详细日志
-    [defaults synchronize];
-    
-    // 恢复并发应用数量限制
-    self.maxConcurrentApps = 10;
-}
-
-- (void)clearLocationCache {
-    // 清理保存的位置数据缓存
-    NSString *cachePath = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
-                          stringByAppendingPathComponent:@"GPSLocationCache"];
-    
-    if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
-        NSError *error = nil;
-        [[NSFileManager defaultManager] removeItemAtPath:cachePath error:&error];
-        
-        if (error) {
-            NSLog(@"清理位置缓存失败: %@", error);
-        }
-    }
-}
-
-#pragma mark - 权限获取实现
-
-- (BOOL)attemptToGetEnhancedPermissions {
-    NSLog(@"正在尝试获取增强权限...");
-    
-    // 先检查已有权限
-    if ([self checkForPrivileges]) {
-        NSLog(@"设备已有必要权限");
+    // 额外检查路径特征
+    NSString *checkPath = @"/var/jb";
+    BOOL isDirectory = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:checkPath isDirectory:&isDirectory] && isDirectory) {
         return YES;
     }
     
-    // 检测当前越狱环境并尝试获取权限
-    BOOL privilegesObtained = NO;
-    NSString *jailbreakType = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakType"];
-    
-    if ([jailbreakType isEqualToString:@"dopamine"]) {
-        privilegesObtained = [self getDopaminePermissions];
-    } else if ([jailbreakType isEqualToString:@"palera1n"]) {
-        privilegesObtained = [self getPalera1nPermissions];
-    } else if ([jailbreakType isEqualToString:@"trollstore"]) {
-        privilegesObtained = [self getTrollStorePermissions];
-    } else {
-        privilegesObtained = [self getLegacyJailbreakPermissions];
-    }
-    
-    // 尝试通用权限获取方法
-    if (!privilegesObtained) {
-        privilegesObtained = [self attemptGenericPrivilegeEscalation];
-    }
-    
-    // 如果成功获取权限，更新系统状态
-    if (privilegesObtained) {
-        NSLog(@"成功获取增强权限");
-        if (self.currentIntegrationLevel < GPSIntegrationLevelDeep) {
-            self.currentIntegrationLevel = GPSIntegrationLevelDeep;
-        }
-        
-        // 创建必要的文件和目录
-        [self createRequiredDirectories];
-        
-        // 保存权限状态
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"HasEnhancedPermissions"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-    } else {
-        NSLog(@"获取增强权限失败");
-        
-        // 显示权限失败通知，提示用户手动操作
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *alert = [UIAlertController 
-                alertControllerWithTitle:@"权限获取失败"
-                message:@"无法自动获取增强权限。请确保设备已越狱并安装了必要的组件。"
-                preferredStyle:UIAlertControllerStyleAlert];
-                
-            [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-            
-            UIWindow *window = [UIApplication sharedApplication].keyWindow;
-            [window.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-    }
-    
-    return privilegesObtained;
-}
-
-- (BOOL)getDopaminePermissions {
-    @try {
-        // 对于Dopamine，采用最低权限模式，不尝试获取额外权限
-        NSLog(@"[GPS++] Dopamine环境下采用安全权限模式");
-        
-        // 简单检查基本权限（非系统级）
-        NSString *testPath = @"/var/mobile/gps_basic_check.txt";
-        if ([@"test" writeToFile:testPath atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
-            [[NSFileManager defaultManager] removeItemAtPath:testPath error:nil];
-            return YES;
-        }
-        
-        // 不尝试使用权限工具
-        return NO;
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] 权限检查异常: %@", exception);
-        return NO;
-    }
-}
-
-// 添加备选权限获取方法
-- (BOOL)tryAlternativeDopaminePermMethod {
-    @try {
-        NSString *jbPrefix = @"/var/jb";
-        NSString *bashPath = [NSString stringWithFormat:@"%@/bin/bash", jbPrefix];
-        
-        if (![[NSFileManager defaultManager] fileExistsAtPath:bashPath]) {
-            bashPath = [NSString stringWithFormat:@"%@/usr/bin/bash", jbPrefix];
-            if (![[NSFileManager defaultManager] fileExistsAtPath:bashPath]) {
-                return NO;
-            }
-        }
-        
-        // 尝试使用特定的越狱扩展功能
-        NSString *testPath = @"/private/var/gps_perm_test.txt";
-        NSString *testContent = @"test";
-        
-        NSTask *task = [[NSTask alloc] init];
-        [task setLaunchPath:bashPath];
-        [task setArguments:@[@"-c", [NSString stringWithFormat:@"echo '%@' > %@", testContent, testPath]]];
-        
-        @try {
-            [task launch];
-            [task waitUntilExit];
-            
-            // 检查文件是否创建成功
-            if ([[NSFileManager defaultManager] fileExistsAtPath:testPath]) {
-                [[NSFileManager defaultManager] removeItemAtPath:testPath error:nil];
-                return YES;
-            }
-        } @catch (NSException *exception) {
-            NSLog(@"[GPS++] 备选权限方法异常: %@", exception);
-        }
-        
-        return NO;
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] 备选权限方法异常: %@", exception);
-        return NO;
-    }
-}
-
-- (BOOL)safeExecuteCommandInDopamine:(NSString *)command {
-    // 在Dopamine环境中，禁用某些可能导致崩溃的命令
-    if ([command containsString:@"launchd"] || 
-        [command containsString:@"locationd"] || 
-        [command containsString:@"/System/Library"]) {
-        NSLog(@"[GPS++] 已阻止可能不安全的命令: %@", command);
-        return NO;
-    }
-    
-    @try {
-        NSString *jbPrefix = [[NSUserDefaults standardUserDefaults] stringForKey:@"JailbreakPrefix"] ?: @"/var/jb";
-        NSString *bashPath = [NSString stringWithFormat:@"%@/bin/bash", jbPrefix];
-        
-        if (![[NSFileManager defaultManager] fileExistsAtPath:bashPath]) {
-            bashPath = [NSString stringWithFormat:@"%@/usr/bin/bash", jbPrefix];
-            if (![[NSFileManager defaultManager] fileExistsAtPath:bashPath]) {
-                NSLog(@"[GPS++] 无法找到bash路径，命令执行失败");
-                return NO;
-            }
-        }
-        
-        // 安全的命令执行
-        NSTask *task = [[NSTask alloc] init];
-        task.launchPath = bashPath;
-        task.arguments = @[@"-c", command];
-        
-        NSPipe *outputPipe = [NSPipe pipe];
-        [task setStandardOutput:outputPipe];
-        [task setStandardError:outputPipe];
-        
-        // 设置超时保护
-        NSDate *startTime = [NSDate date];
-        __block BOOL completed = NO;
-        
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            @try {
-                [task launch];
-                [task waitUntilExit];
-                completed = YES;
-            } @catch (NSException *e) {
-                NSLog(@"[GPS++] 命令执行异常: %@", e);
-            }
-        });
-        
-        // 等待最多3秒
-        while (!completed && [[NSDate date] timeIntervalSinceDate:startTime] < 3) {
-            [NSThread sleepForTimeInterval:0.1];
-        }
-        
-        if (!completed) {
-            NSLog(@"[GPS++] 命令执行超时");
-            // 尝试终止任务
-            [task terminate];
-            return NO;
-        }
-        
-        return (task.terminationStatus == 0);
-    } @catch (NSException *exception) {
-        NSLog(@"[GPS++] 执行命令异常: %@", exception);
-        return NO;
-    }
-}
-
-- (BOOL)getPalera1nPermissions {
-    NSLog(@"尝试获取palera1n越狱环境权限");
-    
-    // 检查palera1n特定文件
-    if (![[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/basebin/palera1n"]) {
-        return NO;
-    }
-    
-    // 尝试使用palera1n权限辅助工具
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/var/jb/usr/bin/sudo"];
-    [task setArguments:@[@"-E", @"touch", @"/private/var/mobile/.gps_integration_authorized"]];
-    
-    @try {
-        [task launch];
-        [task waitUntilExit];
-        
-        // 验证是否成功创建了授权文件
-        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/private/var/mobile/.gps_integration_authorized"]) {
-            return YES;
-        }
-    } @catch (NSException *exception) {
-        NSLog(@"获取palera1n权限异常: %@", exception);
-    }
-    
     return NO;
 }
 
-- (BOOL)getTrollStorePermissions {
-    NSLog(@"尝试获取TrollStore环境权限");
-    
-    // TrollStore环境下有限制，尝试使用可用的权限
-    BOOL canAccessContainer = NO;
-    
-    // 检查是否能访问应用容器目录
-    NSString *containerPath = @"/var/containers/Bundle/Application";
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    
-    if ([fileManager isReadableFileAtPath:containerPath]) {
-        NSError *error = nil;
-        NSArray *contents = [fileManager contentsOfDirectoryAtPath:containerPath error:&error];
-        
-        if (contents && !error) {
-            canAccessContainer = YES;
-        }
-    }
-    
-    // 如果能访问容器目录，尝试在允许的位置创建辅助文件
-    if (canAccessContainer) {
-        NSString *helperPath = @"/var/containers/Bundle/dylibs/gps_helper.plist";
-        NSDictionary *helperDict = @{
-            @"BundleID": [[NSBundle mainBundle] bundleIdentifier],
-            @"AllowLocationSpoofing": @YES,
-            @"AllowBackgroundAccess": @YES
-        };
-        
-        if ([helperDict writeToFile:helperPath atomically:YES]) {
-            return YES;
-        }
-    }
-    
-    return NO;
-}
-
-- (BOOL)getLegacyJailbreakPermissions {
-    NSLog(@"尝试获取传统越狱环境权限");
-    
-    // 尝试几种常见的传统越狱权限获取方法
-    NSArray *helperTools = @[
-        @"/usr/bin/su",
-        @"/usr/bin/sudo",
-        @"/usr/sbin/chown"
-    ];
-    
-    for (NSString *tool in helperTools) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:tool]) {
-            NSTask *task = [[NSTask alloc] init];
-            [task setLaunchPath:tool];
-            
-            if ([tool hasSuffix:@"su"]) {
-                [task setArguments:@[@"mobile", @"-c", @"touch /private/var/mobile/.gps_authorized"]];
-            } else if ([tool hasSuffix:@"sudo"]) {
-                [task setArguments:@[@"touch", @"/private/var/mobile/.gps_authorized"]];
-            } else if ([tool hasSuffix:@"chown"]) {
-                [task setArguments:@[@"mobile:mobile", @"/private/var/mobile"]];
-            }
-            
-            @try {
-                [task launch];
-                [task waitUntilExit];
-                
-                // 检查权限操作是否成功
-                if ([[NSFileManager defaultManager] fileExistsAtPath:@"/private/var/mobile/.gps_authorized"]) {
-                    return YES;
-                }
-            } @catch (NSException *exception) {
-                NSLog(@"执行权限工具异常: %@", exception);
-                continue;
-            }
-        }
-    }
-    
-    return NO;
-}
-
-- (BOOL)attemptGenericPrivilegeEscalation {
-    NSLog(@"尝试通用权限提升方法");
-    
-    // 1. 尝试加载权限辅助模块
-    NSString *dylibPath = [[NSBundle mainBundle] pathForResource:@"GPSPrivilegeHelper" ofType:@"dylib"];
-    if (dylibPath && [[NSFileManager defaultManager] fileExistsAtPath:dylibPath]) {
-        // 添加必要的常量定义，如果系统头文件中不存在
-        #ifndef RTLD_NOW
-        #define RTLD_NOW 0x2
-        #endif
-        
-        // 使用适当的类型转换，避免编译器警告
-        void *handle = dlopen([dylibPath UTF8String], RTLD_NOW);
-        if (handle) {
-            // 使用正确的函数指针声明语法
-            typedef BOOL (*privilege_func_t)(void);
-            privilege_func_t privilege_func = (privilege_func_t)dlsym(handle, "requestPrivileges");
-            
-            if (privilege_func) {
-                BOOL result = privilege_func();
-                dlclose(handle);
-                
-                if (result) {
-                    return YES;
-                }
-            }
-            dlclose(handle);
-        }
-    }
-    
-    // 2. 检查已知的权限辅助应用是否安装
-    NSArray *helperApps = @[
-        @"com.saurik.Cydia",
-        @"org.coolstar.SileoStore",
-        @"xyz.willy.Zebra",
-        @"ru.rejail.filza",
-        @"com.pixelomer.trollstorehelper"
-    ];
-    
-    for (NSString *appId in helperApps) {
-        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@://request_permission", appId]];
-        if ([[UIApplication sharedApplication] canOpenURL:url]) {
-            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
-            
-            // 权限请求已发送，稍后检查
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self checkForPrivileges];
-            });
-            
-            return YES;
-        }
-    }
-    
-    // 3. 尝试创建测试文件确认权限
-    NSArray *testPaths = @[
-        @"/private/var/mobile/GPS_Integration_Test",
-        @"/var/mobile/GPS_Integration_Test",
-        @"/Library/GPS_Integration_Test"
-    ];
-    
-    for (NSString *path in testPaths) {
-        if ([@"test" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
-            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-            return YES;
-        }
-    }
-    
-    return NO;
-}
-
-- (void)createRequiredDirectories {
-    // 创建应用所需的权限目录
-    NSArray *directories = @[
-        @"/var/mobile/Library/GPS++",
-        @"/var/mobile/Library/GPS++/Profiles",
-        @"/var/mobile/Library/GPS++/Cache"
-    ];
-    
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    for (NSString *dir in directories) {
-        if (![fileManager fileExistsAtPath:dir]) {
-            NSError *error = nil;
-            [fileManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error];
-            
-            if (error) {
-                NSLog(@"创建目录失败 %@: %@", dir, error);
-            }
-        }
-    }
-}
-
-- (void)applyIntegrationPrioritySettings {
-    switch (self.integrationPriority) {
-        case 5: // 最高优先级
-            self.maxConcurrentApps = 10;
-            break;
-        case 4:
-            self.maxConcurrentApps = 8;
-            break;
-        case 3: // 默认
-            self.maxConcurrentApps = 5;
-            break;
-        case 2:
-            self.maxConcurrentApps = 3;
-            break;
-        case 1: // 最低优先级
-            self.maxConcurrentApps = 1;
-            break;
-        default:
-            self.maxConcurrentApps = 3;
-            break;
-    }
-    
-    NSLog(@"应用集成优先级已设置为 %ld，最大并发应用数: %ld", 
-          (long)self.integrationPriority, (long)self.maxConcurrentApps);
-}
 @end

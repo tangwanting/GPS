@@ -1,7 +1,7 @@
 Package: com.pxx917144686.gps
 Name: GPS++
 Depends: mobilesubstrate, firmware (>= 15.0)
-Version: 0.2
+Version: 0.3
 Architecture: iphoneos-arm64 iphoneos-arm64e
 Description: 功能强大的iOS位置工具
 Maintainer: pxx917144686

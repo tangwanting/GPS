@@ -8,10 +8,14 @@
         <array>
             <string>com.apple.UIKit</string>
             <string>com.apple.CoreLocation</string>
+            <string>com.apple.MapKit</string>
+            <string>com.apple.locationd</string>
         </array>
         <key>Executables</key>
         <array>
             <string>SpringBoard</string>
+            <string>locationd</string>
+            <string>backboardd</string>
         </array>
         <key>Mode</key>
         <string>Any</string>
