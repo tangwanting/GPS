@@ -9,7 +9,7 @@
             <string>com.apple.UIKit</string>
             <string>com.apple.CoreLocation</string>
             <string>com.apple.MapKit</string>
-            <string>com.apple.locationd</string>
+            <string>com.apple.locationdd</string>
         </array>
         <key>Executables</key>
         <array>
